@@ -1,0 +1,83 @@
+# .github/workflows/deploy.yml
+#
+# CI/CD pipeline with Blue-Green deployment.
+# Triggers on every push to main. It builds the frontend image, pushes it to
+# Docker Hub, then deploys it into whichever colour (blue/green) is currently
+# IDLE and switches traffic to it — achieving a zero-downtime release.
+
+name: Blue-Green Deploy
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:        # also lets you run it manually from the Actions tab
+
+env:
+  IMAGE_REPO: tessayb/new-event
+  CLUSTER_NAME: new-event-cluster
+  CLUSTER_LOCATION: us-central1
+  GCP_PROJECT: static-chiller-501614-a5
+  SERVICE: frontend-service
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Get the code
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. Tag the image with the git commit's short SHA (unique per push)
+      - name: Set image tag
+        run: echo "IMAGE_TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      # 3. Log in to Docker Hub using the stored secrets
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 4. Build the image for the cloud's CPU (amd64) and push it
+      - name: Build and push image
+        run: |
+          docker build --platform linux/amd64 -t "$IMAGE_REPO:$IMAGE_TAG" .
+          docker push "$IMAGE_REPO:$IMAGE_TAG"
+
+      # 5. Authenticate to Google Cloud using the service-account key secret
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      # 6. Install gcloud + the GKE auth plugin, and connect kubectl to the cluster
+      - name: Set up GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.CLUSTER_NAME }}
+          location: ${{ env.CLUSTER_LOCATION }}
+
+      # 7. The Blue-Green logic: find the live colour, deploy to the idle one, switch
+      - name: Blue-Green deploy
+        run: |
+          set -e
+          LIVE_COLOR=$(kubectl get service "$SERVICE" -o jsonpath='{.spec.selector.version}')
+          echo "Currently live: $LIVE_COLOR"
+
+          if [ "$LIVE_COLOR" = "blue" ]; then
+            TARGET_COLOR="green"
+          else
+            TARGET_COLOR="blue"
+          fi
+          echo "Deploying into idle colour: $TARGET_COLOR"
+
+          # Point the idle deployment at the new image and wait for it to be ready
+          kubectl set image "deployment/frontend-$TARGET_COLOR" "frontend=$IMAGE_REPO:$IMAGE_TAG"
+          kubectl rollout status "deployment/frontend-$TARGET_COLOR" --timeout=120s
+
+          # Switch traffic to the idle colour (the instant cutover)
+          kubectl patch service "$SERVICE" \
+            -p "{\"spec\":{\"selector\":{\"app\":\"frontend\",\"version\":\"$TARGET_COLOR\"}}}"
+
+          echo "Traffic switched to $TARGET_COLOR. $LIVE_COLOR kept for rollback."
